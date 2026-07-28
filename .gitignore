@@ -1,0 +1,49 @@
+#
+# Consolidated orangepi-build .gitignore
+# Excludes build artifacts, toolchains, and caches; keeps all source code
+#
+
+# Build artifacts
+output/
+*.img
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.patch
+*.bak
+*.swp
+*.o
+*.ko
+*.cmd
+
+# Toolchains (large, downloadable separately)
+toolchains/
+
+# Temporary / cache
+.tmp/
+external/cache/.gpg/
+external/cache/hash/
+external/cache/rootfs/
+external/cache/debs/
+external/cache/sources/extra/
+external/cache/sources/sunxi-tools/
+external/cache/sources/ffmpeg_kodi*/
+external/cache/sources/hi3403-tools/
+external/cache/sources/t527_packages/
+external/cache/sources/ascend-driver/
+external/cache/sources/orangepi-test/
+external/cache/sources/component_cix*/
+external/cache/sources/rk3588_packages*/
+external/cache/sources/rk356x_packages/
+external/cache/sources/rk-rootfs-build*/
+external/cache/sources/sun60iw2_packages/
+external/cache/sources/rk3399_gst_xserver_libs/
+external/cache/sources/arm-trusted-firmware-2.2-hi3403/
+external/cache/sources/arm-trusted-firmware-sunxi-mainline/
+
+# Backup of original .git
+.git.bak/
+
+# Misc
+b.sh
+mkimage.sh

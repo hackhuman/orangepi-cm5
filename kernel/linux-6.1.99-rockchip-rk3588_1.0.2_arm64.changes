@@ -1,0 +1,38 @@
+Format: 1.8
+Date: Tue, 28 Jul 2026 09:33:13 +0800
+Source: linux-6.1.99-rockchip-rk3588
+Binary: linux-dtb-current-rockchip-rk3588 linux-headers-current-rockchip-rk3588 linux-image-current-rockchip-rk3588 linux-image-current-rockchip-rk3588-dbg
+Built-For-Profiles: noudeb
+Architecture: arm64
+Version: 1.0.2
+Distribution: jammy
+Urgency: low
+Maintainer: Orange Pi <leeboby@aliyun.com>
+Changed-By: Orange Pi <leeboby@aliyun.com>
+Description:
+ linux-dtb-current-rockchip-rk3588 - Linux DTB, version 6.1.99-rockchip-rk3588
+ linux-headers-current-rockchip-rk3588 - Linux kernel headers for 6.1.99-rockchip-rk3588 on arm64
+ linux-image-current-rockchip-rk3588 - Linux kernel, version 6.1.99-rockchip-rk3588
+ linux-image-current-rockchip-rk3588-dbg - Linux kernel debugging symbols for 6.1.99-rockchip-rk3588
+Changes:
+ linux-6.1.99-rockchip-rk3588 (1.0.2) jammy; urgency=low
+ .
+   * Custom built Linux kernel.
+Checksums-Sha1:
+ 12828f0cccbbebc1545298bb8342a0c97adf4d9f 7118 linux-6.1.99-rockchip-rk3588_1.0.2_arm64.buildinfo
+ 3093547080f0a00f7fe31442dcc3fef697888ecf 100088 linux-dtb-current-rockchip-rk3588_1.0.2_arm64.deb
+ 0160fcd712f7099d8ce409a5addd8434aba0e3ce 12783832 linux-headers-current-rockchip-rk3588_1.0.2_arm64.deb
+ 74bbeb5ae5602b11aa57d0acf1f4b2d5ac63686c 72731388 linux-image-current-rockchip-rk3588-dbg_1.0.2_arm64.deb
+ ca31b1470959897777ab5422309ea07f3723442b 23058608 linux-image-current-rockchip-rk3588_1.0.2_arm64.deb
+Checksums-Sha256:
+ 8e5f517d4d5cb8e8ca239f3bb9e302ffa2052d42cdce42b3d7a50e641e86ad87 7118 linux-6.1.99-rockchip-rk3588_1.0.2_arm64.buildinfo
+ 8fd8349fbdb8b9ed32a41666b94285e9618b7c2f2cba5685b6374573c1742cb5 100088 linux-dtb-current-rockchip-rk3588_1.0.2_arm64.deb
+ e96263dd8209037092913f1020456f194a52513634fe772143882818458fa344 12783832 linux-headers-current-rockchip-rk3588_1.0.2_arm64.deb
+ eff9716d2e4e51888ea3ad865607e74516d3044663e3f2097b8920610534ee88 72731388 linux-image-current-rockchip-rk3588-dbg_1.0.2_arm64.deb
+ c07714c882f7e69db8cee45bc7a97c9cadcac8ff313a5978ff698374e7c9a318 23058608 linux-image-current-rockchip-rk3588_1.0.2_arm64.deb
+Files:
+ bab4b341012448b52c99f01929990c9f 7118 kernel optional linux-6.1.99-rockchip-rk3588_1.0.2_arm64.buildinfo
+ 4c5fd535a1792a7db7a1cb822aa355db 100088 kernel optional linux-dtb-current-rockchip-rk3588_1.0.2_arm64.deb
+ d0d7521c1808eb17e8fdceed3dae116b 12783832 kernel optional linux-headers-current-rockchip-rk3588_1.0.2_arm64.deb
+ da8c96fe06d973a9fd81869353fa045c 72731388 debug optional linux-image-current-rockchip-rk3588-dbg_1.0.2_arm64.deb
+ 40e16d06b91c28054935f846e4003430 23058608 kernel optional linux-image-current-rockchip-rk3588_1.0.2_arm64.deb
