@@ -8,9 +8,9 @@
 
 
 [[ -z $VENDOR ]] && VENDOR="Orange Pi"
-[[ -z $ROOTPWD ]] && ROOTPWD="orangepi" # Must be changed @first login
-[[ -z $OPI_USERNAME ]] && OPI_USERNAME="orangepi" 
-[[ -z $OPI_PWD ]] && OPI_PWD="orangepi" 
+[[ -z $ROOTPWD ]] && ROOTPWD="mtzn+=302" # Must be changed @first login
+[[ -z $OPI_USERNAME ]] && OPI_USERNAME="mtzn"
+[[ -z $OPI_PWD ]] && OPI_PWD="mtzn+=302"
 [[ -z $MAINTAINER ]] && MAINTAINER="Orange Pi" # deb signature
 [[ -z $MAINTAINERMAIL ]] && MAINTAINERMAIL="leeboby@aliyun.com" # deb signature
 [[ -z $DEB_COMPRESS ]] && DEB_COMPRESS="xz" # compress .debs with XZ by default. Use 'none' for faster/larger builds
