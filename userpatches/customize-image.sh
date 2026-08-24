@@ -39,7 +39,33 @@ Main() {
 			# your code here
 			;;
 	esac
+	SetStaticEthernetIP
 } # Main
+
+SetStaticEthernetIP() {
+	# 目标系统的有线网口名：RK3588 通常为 end0 或 eth0，可用
+	# LANG=C nmcli -t -f GENERAL.DEVICE dev status 在目标机上确认后固定
+	local iface="enP3p49s0"
+	local ip="192.168.2.3"
+	local mask=24
+	local gw="192.168.2.1"
+	local dns1=("192.168.2.1" "8.8.8.8")
+
+	cat > /etc/NetworkManager/system-connections/"${iface}".nmconnection <<- EOF
+	[connection]
+	id=${iface}
+	uuid=$(cat /proc/sys/kernel/random/uuid)
+	type=ethernet
+	interface-name=${iface}
+	autoconnect=true
+
+	[ipv4]
+	method=manual
+	address1=${ip}/${mask},${gw}
+	dns=${dns1[@]}
+	EOF
+	chmod 600 /etc/NetworkManager/system-connections/"${iface}".nmconnection
+}
 
 InstallOpenMediaVault() {
 	# use this routine to create a Debian based fully functional OpenMediaVault
