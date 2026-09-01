@@ -24,7 +24,7 @@
 #define GMAX4002_ACTIVE_HEIGHT (GMAX4002_HEIGHT - GMAX4002_DUMMY_ROWS)
 
 static const struct v4l2_fract GMAX4002_MAX_FPS = { .numerator = 1,
-													.denominator = 30 };
+													.denominator = 166 };
 #define GMAX4002_FRAME_INTERVAL GMAX4002_MAX_FPS
 #define GMAX4002_FRAME_CODE MEDIA_BUS_FMT_Y10_1X10
 
