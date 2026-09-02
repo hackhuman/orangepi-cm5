@@ -847,9 +847,9 @@
 		i2c1m2_xfer: i2c1m2-xfer {
 			rockchip,pins =
 				/* i2c1_scl_m2 */
-				<0 RK_PD4 9 &pcfg_pull_up_smt>,
+				<0 RK_PD4 9 &pcfg_pull_none_smt>,
 				/* i2c1_sda_m2 */
-				<0 RK_PD5 9 &pcfg_pull_up_smt>;
+				<0 RK_PD5 9 &pcfg_pull_none_smt>;
 		};
 
 		/omit-if-no-ref/
