@@ -120,6 +120,29 @@
 #define GPIO2_OutStatus 0x103C
 /* register ends*/
 
+/* ---- exposure/gain control, exposed as standard V4L2 controls so the
+ * ---- Rockchip ISP 3A (rkaiq) can drive AE/AGC ------------------------- */
+/*
+ * Exposure_Mode (0xC04) / Gain_Mode (0xC1C):
+ *   0 = manual. The RK ISP 3A owns exposure/gain instead of the FPGA's
+ *   internal AE/AGC. (auto values kept for reference only; unused here.)
+ */
+#define MV_EXPOSURE_MODE_AUTO     2
+#define MV_EXPOSURE_MODE_MANUAL   0
+#define MV_GAIN_MODE_AUTO         2
+#define MV_GAIN_MODE_MANUAL       0
+
+/*
+ * Exposure units:
+ *   rkaiq writes V4L2_CID_EXPOSURE in "line" units; ME_Time (0xC10) is in
+ *   microseconds, so the driver converts with mvcam->line_time_us (sensor
+ *   row time), computed at runtime from max-fps x height. Set
+ *   MV_CAM_LINE_TIME_US_OVERRIDE to a non-zero value to hardcode it.
+ *   V4L2_CID_ANALOGUE_GAIN maps 1:1 to Manual_Gain (0xC20): step 0.1 dB
+ *   per LSB (some models 0.3 dB), 0 = 0 dB = 1x.
+ */
+#define MV_CAM_LINE_TIME_US_OVERRIDE   0
+
 #define MVCAM_MAX_CTRLS 40
 
 /* user define v4l2 controls*/

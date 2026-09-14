@@ -50,8 +50,8 @@
 		pwdn-gpios = <&gpio4 RK_PA7 GPIO_ACTIVE_HIGH>;
 		rockchip,camera-module-index = <0>;
 		rockchip,camera-module-facing = "back";
-		rockchip,camera-module-name = "NC";
-		rockchip,camera-module-lens-name = "NC";
+		rockchip,camera-module-name = "rpi-camera-v1";
+		rockchip,camera-module-lens-name = "default";
 		port {
 			mvcam_out1: endpoint {
 				remote-endpoint = <&mipidphy1_in_ucam0>;

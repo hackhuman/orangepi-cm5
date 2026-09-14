@@ -30,6 +30,24 @@
 #include <linux/of_gpio.h>
 
 /*
+ * Frame-rate lock, as a compile-time switch so it can be toggled without
+ * rebuilding the whole s_ctrl. Root cause found: rkaiq reads the sensor's
+ * max_fps (213) and drives it flat-out via vblank=0; at ~213fps the ISP
+ * cannot keep up and the stream stalls. Locking to 30fps fixed the stall.
+ *
+ * Expected end-state: once the IQ file / cam-groups give the ISP real params,
+ * re-measure 213fps; if it streams stably with AE running, set this to 0 so
+ * the frame rate is fully rkaiq-controlled again. If it still stalls at high
+ * fps with params present, then instead of a hard lock the sensor should
+ * report a real stable-max frame rate to rkaiq (enum/g_frame_interval).
+ *
+ * MVCAM_ENABLE_FPS_LOCK is honoured in mvcam_s_ctrl()'s VBLANK case and in
+ * mvcam_start_streaming(). MVCAM_LOCKED_FPS is the frame rate used while locked.
+ */
+#define MVCAM_ENABLE_FPS_LOCK	1
+#define MVCAM_LOCKED_FPS	30U
+
+/*
 
 v1.0.8
 1. Fix bug: Corrected erroneous model names for some RAW cameras in sysfs.
@@ -137,6 +155,8 @@ struct mvcam {
     //max fps @ current roi format
     u32 max_fps;
     u32 cur_fps;
+    u32 line_time_us;   /* sensor row time (us), for line<->us exposure conversion */
+    u32 exp_max_lines;  /* absolute exposure cap from AE_MAX_Time, in lines */
     u32 h_flip;
     u32 v_flip;
     u32 lane_num;
@@ -148,7 +168,13 @@ struct mvcam {
     struct v4l2_ctrl *ctrls[MVCAM_MAX_CTRLS];
 	/* V4L2 Controls */
     struct v4l2_ctrl *frmrate;
-    
+    /*
+     * Cached pointers to controls that s_ctrl has to touch. s_ctrl runs with
+     * ctrl_handler.lock held, so it must never call v4l2_ctrl_find() - that
+     * takes the same (non-recursive) lock and self-deadlocks.
+     */
+    struct v4l2_ctrl *exposure;
+
 	/*
 	 * Mutex for serialized access:
 	 * Protect sensor module set pad format and start/stop streaming safely.
@@ -286,6 +312,23 @@ static u32 bit_count(u32 n)
     return n ;
 }
 
+/*
+ * Framerate / MaxFrame_Rate are stored x100 (e.g. 2200 = 22.00 fps) and come
+ * back as 0xFFFFFFFF when the camera has nothing to report. Treat anything
+ * that cannot yield a sane integer fps as "unknown".
+ */
+static u32 mvcam_fps_from_reg(u32 reg)
+{
+	u32 fps;
+
+	if (!reg || reg == 0xFFFFFFFF)
+		return 0;
+	fps = reg / 100;
+	if (!fps || fps > 1000) /* guard against garbage like 0xFFFFFF */
+		return 0;
+	return fps;
+}
+
 static int mvcam_getroi(struct mvcam *mvcam)
 {
   //  int ret;
@@ -297,6 +340,29 @@ static int mvcam_getroi(struct mvcam *mvcam)
     v4l2_dbg(1, debug, mvcam->client, "%s:get roi(%d,%d,%d,%d)\n",
 			 __func__, mvcam->roi.left,mvcam->roi.top,mvcam->roi.width,mvcam->roi.height);
     return 0;
+}
+
+static void mvcam_update_line_time(struct mvcam *mvcam)
+{
+	u32 height;
+
+	/* Optional hardcoded row time; else derive it from max-fps x height. */
+	mvcam->line_time_us = MV_CAM_LINE_TIME_US_OVERRIDE;
+	if (mvcam->line_time_us)
+		return;
+
+	height = mvcam->roi.height ? mvcam->roi.height : mvcam->max_height;
+	if (height && mvcam->max_fps) {
+		u64 rows_per_s = (u64)mvcam->max_fps * height;
+
+		if (rows_per_s <= 1000000ULL)
+			mvcam->line_time_us = 1000000ULL / rows_per_s;
+	}
+	if (!mvcam->line_time_us)
+		mvcam->line_time_us = 1000; /* ~1 ms fallback */
+	/* never hand a 0 to the exposure/vblank dividers */
+	if (mvcam->line_time_us < 1)
+		mvcam->line_time_us = 1;
 }
 
 static int mvcam_setroi(struct mvcam *mvcam)
@@ -314,12 +380,17 @@ static int mvcam_setroi(struct mvcam *mvcam)
     msleep(1);
     mvcam_write(client, ROI_Height,mvcam->roi.height);
     msleep(8);
-    //get sensor max framerate 
+    //get sensor max framerate
     mvcam_read(client, MaxFrame_Rate,&fps_reg);
-    mvcam->max_fps = fps_reg/100;
+    mvcam->max_fps = mvcam_fps_from_reg(fps_reg);
+    mvcam_update_line_time(mvcam);
     mvcam_read(client, Framerate,&fps_reg);
-    mvcam->cur_fps = fps_reg/100;
-    v4l2_ctrl_modify_range(mvcam->frmrate, 1, mvcam->max_fps, 1, mvcam->cur_fps);
+    mvcam->cur_fps = mvcam_fps_from_reg(fps_reg);
+    if (!mvcam->cur_fps)
+        mvcam->cur_fps = mvcam->max_fps;
+    if (mvcam->frmrate && mvcam->max_fps)
+        v4l2_ctrl_modify_range(mvcam->frmrate, 1, mvcam->max_fps, 1,
+                               mvcam->cur_fps ? mvcam->cur_fps : mvcam->max_fps);
     
 //    dev_info(&client->dev,
 //			 "max fps is %d,cur fps %d\n",
@@ -346,6 +417,35 @@ static int mvcam_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
         ctrl->val = ctrl->val/100;
         mvcam->cur_fps = ctrl->val;
 		break;
+	case V4L2_CID_EXPOSURE:
+		/*
+		 * Exp_Time (0xC18) is microseconds, rkaiq works in lines.
+		 * mvcam_read() leaves *value untouched when the transfer
+		 * fails, so keep the cached value and report success: a
+		 * failed readback must not turn into an error that breaks
+		 * rkaiq's whole VIDIOC_G_EXT_CTRLS batch.
+		 */
+		if (!mvcam_read(client, Exp_Time, &ctrl->val))
+			ctrl->val = ctrl->val /
+				(mvcam->line_time_us ? mvcam->line_time_us : 1);
+		/*
+		 * Seeing these lines at all means somebody (rkaiq's AE) is
+		 * polling the control, i.e. the 3A loop is closed on this
+		 * sensor. Silence here while "[ae] exposure set" is printing
+		 * means rkaiq writes but never reads back.
+		 */
+		dev_info_ratelimited(&client->dev,
+			"[ae] exposure readback -> %d lines (line_time %u us)\n",
+			ctrl->val, mvcam->line_time_us);
+		ret = 0;
+		break;
+	case V4L2_CID_ANALOGUE_GAIN:
+		/* same as above: report success, keep the cached value on failure */
+		mvcam_read(client, Cur_Gain, &ctrl->val);
+		dev_info_ratelimited(&client->dev,
+			"[ae] gain readback -> %d\n", ctrl->val);
+		ret = 0;
+		break;
 	default:
 		dev_info(&client->dev,
 			 "mvcam_g_volatile_ctrl ctrl(id:0x%x,val:0x%x) is not handled\n",
@@ -359,6 +459,8 @@ static int mvcam_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 
 	return ret;
 }
+
+#define MVCAM_AIQ_LINE_TIME_NS 28736ULL
 
 static int mvcam_s_ctrl(struct v4l2_ctrl *ctrl)
 {
@@ -381,8 +483,9 @@ static int mvcam_s_ctrl(struct v4l2_ctrl *ctrl)
         ret = mvcam_write(client, Trigger_Software,1);
 		break;
 	case V4L2_CID_VEYE_MV_FRAME_RATE:
-        ret = mvcam_write(client, Framerate,ctrl->val*100);
-        mvcam->cur_fps = ctrl->val;
+        /* 0 would stop the camera: Framerate = 0 means "no output" */
+        mvcam->cur_fps = ctrl->val ? ctrl->val : 1;
+        ret = mvcam_write(client, Framerate, mvcam->cur_fps * 100);
 		break;
     case V4L2_CID_VEYE_MV_ROI_X:
         mvcam->roi.left = rounddown(ctrl->val, MV_CAM_ROI_W_ALIGN);
@@ -396,6 +499,129 @@ static int mvcam_s_ctrl(struct v4l2_ctrl *ctrl)
 			 ctrl->val, mvcam->roi.top);
         ret = 0;
 		break;
+	case V4L2_CID_EXPOSURE: {
+		u64 t;
+
+		t = DIV_ROUND_CLOSEST_ULL(
+				(u64)ctrl->val *
+				MVCAM_AIQ_LINE_TIME_NS,
+				1000ULL);
+
+		ret = mvcam_write(client,
+						Exposure_Mode,
+						MV_EXPOSURE_MODE_MANUAL);
+		if (ret)
+			break;
+
+		ret = mvcam_write(client,
+						ME_Time,
+						(u32)t);
+
+		dev_info_ratelimited(&client->dev,
+			"[ae] exposure %d lines -> %llu us\n",
+			ctrl->val, t);
+
+		break;
+	}
+	case V4L2_CID_ANALOGUE_GAIN: {
+		u32 man_gain = 0, cur_gain = 0, gain_mode = 0;
+
+		ret = mvcam_write(client, Gain_Mode, MV_GAIN_MODE_MANUAL);
+		ret |= mvcam_write(client, Manual_Gain, ctrl->val);
+		/* same idea as exposure: Cur_Gain is the applied value */
+		mvcam_read(client, Manual_Gain, &man_gain);
+		mvcam_read(client, Cur_Gain, &cur_gain);
+		mvcam_read(client, Gain_Mode, &gain_mode);
+		dev_info_ratelimited(&client->dev,
+			"[ae] gain set %d | readback Manual_Gain %u, Cur_Gain %u, Gain_Mode %u (0=manual)\n",
+			ctrl->val, man_gain, cur_gain, gain_mode);
+		break;
+	}
+	case V4L2_CID_VBLANK: {
+		u32 height = mvcam->roi.height ? mvcam->roi.height : mvcam->max_height;
+		u32 vts;
+		struct v4l2_ctrl *exp;
+
+#if MVCAM_ENABLE_FPS_LOCK
+		/*
+		 * Legacy rcaiq flat-out workaround: pin Framerate at
+		 * MVCAM_LOCKED_FPS regardless of the vblank the AE writes, and use
+		 * the locked vts below so the exposure ceiling stays at AE_MAX_Time.
+		 * The control still exists and accepts writes, so rkaiq keeps
+		 * driving exposure/gain. See the switch definition at top of file.
+		 */
+		vts = mvcam->line_time_us ?
+			1000000UL / (mvcam->line_time_us * MVCAM_LOCKED_FPS) : 0;
+		if (vts <= height)
+			vts = height + 1;
+		mvcam->cur_fps = MVCAM_LOCKED_FPS;
+		ret = mvcam_write(client, Framerate, MVCAM_LOCKED_FPS * 100);
+		dev_info_ratelimited(&client->dev,
+			"[ae] vblank set %d (locked %ufps) -> vts %u (height %u), fps %u\n",
+			ctrl->val, MVCAM_LOCKED_FPS, vts, height, MVCAM_LOCKED_FPS);
+#else
+		/*
+		 * Normal path: honour the AE's vblank. line_time * vts gives the
+		 * frame period, so fps = 1e6/(line_time_us * vts); push that into
+		 * Framerate so the FPGA inserts the right amount of blanking.
+		 */
+		{
+			u32 fps;
+
+			vts = height + (u32)ctrl->val;
+			fps = (mvcam->line_time_us && vts) ?
+				1000000UL / (mvcam->line_time_us * vts) : 0;
+			if (!fps)
+				fps = 1;
+			mvcam->cur_fps = fps;
+			ret = mvcam_write(client, Framerate, fps * 100);
+			dev_info_ratelimited(&client->dev,
+				"[ae] vblank set %d -> vts %u (height %u), fps %u\n",
+				ctrl->val, vts, height, fps);
+		}
+#endif
+
+		/*
+		 * Exposure can never exceed one frame, so grow/shrink its range
+		 * with vts, but never past the camera's own AE_MAX_Time limit.
+		 * Same pattern as sc132gs/ov9281: without this rkaiq's AE keeps
+		 * asking for exposures that cannot fit in the frame.
+		 */
+		/*
+		 * Never call v4l2_ctrl_find() here: s_ctrl is invoked with
+		 * ctrl_handler.lock held and v4l2_ctrl_find() takes that very
+		 * lock, which deadlocks the probe (v4l2_ctrl_handler_setup())
+		 * before the board ever finishes booting. The pointer is
+		 * cached in mvcam->exposure at control-creation time.
+		 */
+		exp = mvcam->exposure;
+		if (exp) {
+			s64 max = mvcam->exp_max_lines;
+			s64 def = exp->default_value;
+
+			if (vts && max > (s64)vts)
+				max = vts;
+			/* def outside [min, max] makes check_range() reject us */
+			if (def > max)
+				def = max;
+			if (def < exp->minimum)
+				def = exp->minimum;
+			if (max > exp->minimum)
+				__v4l2_ctrl_modify_range(exp, exp->minimum, max,
+							 exp->step, def);
+		}
+		break;
+	}
+	case V4L2_CID_HFLIP:
+		mvcam->h_flip = ctrl->val;
+		/* TODO: write Image_Direction (0x828) if a hardware flip is needed */
+		ret = 0;
+		break;
+	case V4L2_CID_VFLIP:
+		mvcam->v_flip = ctrl->val;
+		ret = 0;
+		break;
+
 	default:
 		dev_info(&client->dev,
 			 "mvcam_s_ctrl ctrl(id:0x%x,val:0x%x) is not handled\n",
@@ -435,6 +661,112 @@ static struct v4l2_ctrl_config mvcam_v4l2_ctrls[] = {
 		.max = MV_CAM_PIXEL_RATE,
 		.step = 1,
 		.flags = V4L2_CTRL_FLAG_READ_ONLY,
+	},
+		//standard v4l2 ctrls for RK ISP 3A (AE/AGC)
+	{
+		.ops = &mvcam_ctrl_ops,
+		.id = V4L2_CID_EXPOSURE,
+		.name = NULL,//kernel will fill it
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.def = 1000,//overwritten at probe from Exp_Time
+		.min = 1,
+		.max = 1000000,//overwritten at probe from AE_MAX_Time
+		.step = 1,
+		/*
+		 * EXECUTE_ON_WRITE is mandatory here: try_or_set_cluster() only
+		 * calls s_ctrl when cluster_changed() reports a change, and
+		 * cluster_changed() short-circuits on VOLATILE controls without
+		 * setting that flag. A standalone VOLATILE control with no
+		 * EXECUTE_ON_WRITE is silently unwritable - rkaiq's writes would
+		 * be dropped. Same idiom as frame_rate/trigger_mode below.
+		 */
+		.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+	},
+	{
+		.ops = &mvcam_ctrl_ops,
+		.id = V4L2_CID_ANALOGUE_GAIN,
+		.name = NULL,//kernel will fill it
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.def = 0,//overwritten at probe from Manual_Gain
+		.min = 0,
+		.max = 0xFFFF,//overwritten at probe from AG_Max_Gain
+		.step = 1,
+		/* see the EXPOSURE entry above for why EXECUTE_ON_WRITE is needed */
+		.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+	},
+	//standard v4l2-ctrls for rkaiq timing / flip
+	/*
+	 * VBLANK has to exist, and it has to be the honest value.
+	 *
+	 * rkaiq's AE sets vblank as part of its exposure/gain configuration.
+	 * With the control missing it logs "cam0 failed to set vblank
+	 * result(val: -1200)" and - the part that matters - never writes
+	 * V4L2_CID_EXPOSURE or V4L2_CID_ANALOGUE_GAIN during streaming at all,
+	 * which is precisely the original "ISP cannot control exposure"
+	 * symptom. With the control present, AE drives exposure and gain
+	 * normally.
+	 *
+	 * The catch, and the reason this was briefly disabled: this sensor runs
+	 * a ~3us line time and reaches 30fps by inserting ~9900 blanking rows,
+	 * so ~89% of the frame is vblank. Registering VBLANK wakes rkcif's
+	 * early-line path, which assumes vblank is well under 1ms worth of
+	 * lines, and it computed wait_line = height - early_line with
+	 * early_line = 10777 against a height of 1200 - an unsigned underflow
+	 * that programmed a nonsense line number and killed capture after one
+	 * frame.
+	 *
+	 * That is fixed on the rkcif side: see sditf_update_wait_line() in
+	 * drivers/media/platform/rockchip/cif/subdev-itf.c. Do not turn this
+	 * off without also reverting / reworking that clamp - and do not turn
+	 * it off expecting exposure control to keep working, because it will
+	 * not.
+	 */
+#define MVCAM_ENABLE_VBLANK_CTRL 1
+#if MVCAM_ENABLE_VBLANK_CTRL
+	{
+		.ops = &mvcam_ctrl_ops,
+		.id = V4L2_CID_VBLANK,
+		.name = NULL,//kernel will fill it
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.def = 0,//overwritten at probe
+		.min = 0,
+		.max = 0xFFFF,//overwritten at probe
+		.step = 1,
+		.flags = 0,
+	},
+#endif
+	{
+		.ops = NULL,//read-only
+		.id = V4L2_CID_HBLANK,
+		.name = NULL,//kernel will fill it
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.def = 0,//overwritten at probe
+		.min = 0,
+		.max = 0xFFFF,
+		.step = 1,
+		.flags = V4L2_CTRL_FLAG_READ_ONLY,
+	},
+	{
+		.ops = &mvcam_ctrl_ops,
+		.id = V4L2_CID_HFLIP,
+		.name = NULL,//kernel will fill it
+		.type = V4L2_CTRL_TYPE_BOOLEAN,
+		.def = 0,
+		.min = 0,
+		.max = 1,
+		.step = 1,
+		.flags = 0,
+	},
+	{
+		.ops = &mvcam_ctrl_ops,
+		.id = V4L2_CID_VFLIP,
+		.name = NULL,//kernel will fill it
+		.type = V4L2_CTRL_TYPE_BOOLEAN,
+		.def = 0,
+		.min = 0,
+		.max = 1,
+		.step = 1,
+		.flags = 0,
 	},
 	//custom v4l2-ctrls
 	{
@@ -508,6 +840,13 @@ static void mvcam_v4l2_ctrl_grab(struct mvcam *mvcam,bool grabbed)
 {
     int i = 0;
     for (i = 0; i < ARRAY_SIZE(mvcam_v4l2_ctrls); ++i) {
+		/*
+		 * A control that failed to register leaves ctrls[i] NULL; the
+		 * array may also have grown without every entry being filled.
+		 * Never dereference it unconditionally.
+		 */
+		if (!mvcam->ctrls[i])
+			continue;
 		switch(mvcam->ctrls[i]->id)
         {
             case V4L2_CID_VEYE_MV_TRIGGER_MODE:
@@ -544,9 +883,16 @@ static void mvcam_v4l2_ctrl_init(struct mvcam *mvcam)
             break;
             case V4L2_CID_VEYE_MV_FRAME_RATE:
                 mvcam_read(client, Framerate,&value);
-                mvcam_v4l2_ctrls[i].def = value/100;
+                mvcam_v4l2_ctrls[i].def = mvcam_fps_from_reg(value);
+                if (!mvcam_v4l2_ctrls[i].def)
+                    mvcam_v4l2_ctrls[i].def = MV_CAM_DEF_FPS;
                 mvcam_read(client, MaxFrame_Rate,&value);
-                mvcam_v4l2_ctrls[i].max = value/100;
+                mvcam_v4l2_ctrls[i].max = mvcam_fps_from_reg(value);
+                if (!mvcam_v4l2_ctrls[i].max)
+                    mvcam_v4l2_ctrls[i].max = MV_CAM_DEF_FPS;
+                //never report a default above the maximum (breaks modify_range)
+                if (mvcam_v4l2_ctrls[i].def > mvcam_v4l2_ctrls[i].max)
+                    mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].max;
                 v4l2_dbg(1, debug, mvcam->client, "%s:default framerate %lld , max fps %lld \n", __func__, \
                     mvcam_v4l2_ctrls[i].def,mvcam_v4l2_ctrls[i].max);
             break;
@@ -562,6 +908,117 @@ static void mvcam_v4l2_ctrl_init(struct mvcam *mvcam)
                 mvcam_v4l2_ctrls[i].max = mvcam->max_height - mvcam->min_height;
 				mvcam_v4l2_ctrls[i].def = mvcam->roi.top;
             break;
+			case V4L2_CID_EXPOSURE: {
+				u32 fps_reg = 0;
+				u32 exp_us_max = 0;
+				mvcam_read(client, MaxFrame_Rate, &fps_reg);
+				mvcam->max_fps = mvcam_fps_from_reg(fps_reg);
+				if (!mvcam->max_fps)
+					mvcam->max_fps = MV_CAM_DEF_FPS;
+				mvcam_update_line_time(mvcam);
+				/* current exposure -> default (us to lines) */
+				mvcam_read(client, Exp_Time, &value);
+				if (value && value != 0xFFFFFFFF)
+					mvcam_v4l2_ctrls[i].def = value / mvcam->line_time_us;
+				/* max exposure -> upper bound (us to lines) */
+				mvcam_read(client, AE_MAX_Time, &exp_us_max);
+				if (exp_us_max && exp_us_max != 0xFFFFFFFF)
+					mvcam_v4l2_ctrls[i].max =
+						exp_us_max / mvcam->line_time_us;
+				else
+					mvcam_v4l2_ctrls[i].max =
+						1000000UL / mvcam->line_time_us;
+				/* keep def inside [min,max] or the ctrl fails to register */
+				if (mvcam_v4l2_ctrls[i].max < mvcam_v4l2_ctrls[i].min + 1)
+					mvcam_v4l2_ctrls[i].max =
+						mvcam_v4l2_ctrls[i].min + 1;
+				if (mvcam_v4l2_ctrls[i].def < mvcam_v4l2_ctrls[i].min)
+					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].min;
+				if (mvcam_v4l2_ctrls[i].def > mvcam_v4l2_ctrls[i].max)
+					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].max;
+				/* hard cap, re-applied whenever vblank changes */
+				mvcam->exp_max_lines = mvcam_v4l2_ctrls[i].max;
+				/*
+				 * One-shot at probe: the numbers every later [ae] line
+				 * has to be read against. If line_time is absurd here,
+				 * every lines -> microseconds conversion is off by the
+				 * same factor, so check this line first.
+				 */
+				dev_info(&client->dev,
+					 "[ae] exposure range %lld..%lld lines (def %lld), line_time %u us, Exp_Time %u us, AE_MAX_Time %u us\n",
+					 mvcam_v4l2_ctrls[i].min,
+					 mvcam_v4l2_ctrls[i].max,
+					 mvcam_v4l2_ctrls[i].def,
+					 mvcam->line_time_us, value, exp_us_max);
+				break;
+			}
+			case V4L2_CID_ANALOGUE_GAIN:
+				mvcam_read(client, Manual_Gain, &value);
+				if (value && value != 0xFFFFFFFF)
+					mvcam_v4l2_ctrls[i].def = value;
+				mvcam_read(client, AG_Max_Gain, &value);
+				if (value && value != 0xFFFFFFFF)
+					mvcam_v4l2_ctrls[i].max = value;
+				/*
+				 * A def above max (or a max the camera reported as
+				 * 0) makes check_range() reject the control, and
+				 * v4l2_ctrl_new() then poisons the whole handler
+				 * with an error. Clamp hard.
+				 */
+				if (mvcam_v4l2_ctrls[i].max < mvcam_v4l2_ctrls[i].min + 1)
+					mvcam_v4l2_ctrls[i].max = mvcam_v4l2_ctrls[i].min + 1;
+				if (mvcam_v4l2_ctrls[i].def < mvcam_v4l2_ctrls[i].min)
+					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].min;
+				if (mvcam_v4l2_ctrls[i].def > mvcam_v4l2_ctrls[i].max)
+					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].max;
+				break;
+			case V4L2_CID_VBLANK: {
+				u32 height = mvcam->roi.height ? mvcam->roi.height : mvcam->max_height;
+				mvcam_read(client, Framerate, &value);
+				mvcam->cur_fps = mvcam_fps_from_reg(value);
+				if (!mvcam->cur_fps)
+					mvcam->cur_fps = mvcam->max_fps;
+				if (mvcam->line_time_us && mvcam->cur_fps && height) {
+					s64 vts = 1000000ULL / ((s64)mvcam->line_time_us * mvcam->cur_fps);
+					if (vts > height)
+						mvcam_v4l2_ctrls[i].def = vts - height;
+				}
+				if (mvcam->line_time_us) {
+					u32 max_vts = 1000000UL / mvcam->line_time_us;
+					if (max_vts > height)
+						mvcam_v4l2_ctrls[i].max = max_vts - height;
+					else
+						mvcam_v4l2_ctrls[i].max = height;
+				}
+				/*
+				 * rkcif_get_linetime() bails out (and breaks the
+				 * ISP early-line timing) when the sensor reports a
+				 * zero vblank default, so never hand it 0.
+				 */
+				if (mvcam_v4l2_ctrls[i].max < 1)
+					mvcam_v4l2_ctrls[i].max = 1;
+				if (mvcam_v4l2_ctrls[i].def < 1)
+					mvcam_v4l2_ctrls[i].def = 1;
+				if (mvcam_v4l2_ctrls[i].def > mvcam_v4l2_ctrls[i].max)
+					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].max;
+				dev_info(&client->dev,
+					 "[ae] vblank range %lld..%lld (def %lld), height %u, fps %u, max_fps %u\n",
+					 mvcam_v4l2_ctrls[i].min,
+					 mvcam_v4l2_ctrls[i].max,
+					 mvcam_v4l2_ctrls[i].def, height,
+					 mvcam->cur_fps, mvcam->max_fps);
+				break;
+			}
+			case V4L2_CID_HBLANK: {
+				u32 width = mvcam->roi.width ? mvcam->roi.width : mvcam->max_width;
+				u32 hts = mvcam->line_time_us * (MV_CAM_PIXEL_RATE / 1000000UL);
+				if (hts > width) {
+					mvcam_v4l2_ctrls[i].def = hts - width;
+					mvcam_v4l2_ctrls[i].min = hts - width;
+					mvcam_v4l2_ctrls[i].max = hts - width;
+				}
+				break;
+			}
             default:
             break;
         }
@@ -626,10 +1083,18 @@ static int mvcam_g_frame_interval(struct v4l2_subdev *sd,
     /* max framerate */
 	struct v4l2_fract fract_fps;
 	struct mvcam *mvcam = to_mvcam(sd);
+	u32 fps;
     VEYE_TRACE
 	mutex_lock(&mvcam->mutex);
-    fract_fps.numerator = 100;
-    fract_fps.denominator = mvcam->cur_fps*100;
+	fps = mvcam->cur_fps ? mvcam->cur_fps : mvcam->max_fps;
+	if (!fps)
+		fps = MV_CAM_DEF_FPS;
+	/*
+	 * rkcif_get_linetime() divides by this and refuses to work when the
+	 * denominator is 0, so never report a 0 fps.
+	 */
+    fract_fps.numerator = 1;
+    fract_fps.denominator = fps;
 	fi->interval = fract_fps;
 	mutex_unlock(&mvcam->mutex);
 
@@ -650,6 +1115,14 @@ static int mvcam_s_frame_interval(struct v4l2_subdev *sd,
 
 	mutex_lock(&mvcam->mutex);
     mvcam->cur_fps = fi->interval.denominator/fi->interval.numerator;
+    /*
+     * A 0 here would write Framerate = 0, i.e. ask the camera to stop
+     * streaming. Clamp into [1, max_fps] instead.
+     */
+    if (!mvcam->cur_fps)
+        mvcam->cur_fps = 1;
+    if (mvcam->max_fps && mvcam->cur_fps > mvcam->max_fps)
+        mvcam->cur_fps = mvcam->max_fps;
     mvcam_write(mvcam->client, Framerate,mvcam->cur_fps*100);
 	mutex_unlock(&mvcam->mutex);
 
@@ -882,6 +1355,15 @@ static long mvcam_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	case RKMODULE_GET_MODULE_INFO:
 		mvcam_get_module_inf(mvcam, (struct rkmodule_inf *)arg);
 		break;
+	case RKMODULE_GET_HDR_CFG: {
+		struct rkmodule_hdr_cfg *hdr = (struct rkmodule_hdr_cfg *)arg;
+		hdr->hdr_mode = NO_HDR;
+		break;
+	}
+	case RKMODULE_SET_HDR_CFG:
+		/* linear (NO_HDR) is the only supported mode */
+		ret = 0;
+		break;
     case RKMODULE_GET_CHANNEL_INFO:
 		ch_info = (struct rkmodule_channel_info *)arg;
 		ret = mvcam_get_channel_info(mvcam, ch_info);
@@ -1094,6 +1576,33 @@ static int mvcam_start_streaming(struct mvcam *mvcam)
  //   ret =  __v4l2_ctrl_handler_setup(mvcam->sd.ctrl_handler);
     debug_printk("mvcam_start_streaming \n");
 	/* set stream on register */
+		/* Force manual exposure/gain so the FPGA's internal AE/AGC does not
+	 * override the values written by the RK ISP 3A. */
+	mvcam_write(client, Exposure_Mode, MV_EXPOSURE_MODE_MANUAL);
+	mvcam_write(client, Gain_Mode, MV_GAIN_MODE_MANUAL);
+#if MVCAM_ENABLE_FPS_LOCK
+	/*
+	 * Pin the frame rate at stream on. Without this the FPGA runs at its
+	 * stored Framerate (the sensor's max, ~213fps) because nothing writes
+	 * Framerate before the first VSYNC - see MVCAM_ENABLE_FPS_LOCK.
+	 */
+	mvcam_write(client, Framerate, MVCAM_LOCKED_FPS * 100);
+#endif
+	{
+		/*
+		 * Streaming start is the dividing line: [ae] lines from here on
+		 * come from rkaiq's AE. Nothing after this point means the 3A
+		 * never took ownership of the sensor.
+		 */
+		u32 exp_mode = 0, gain_mode = 0;
+
+		mvcam_read(client, Exposure_Mode, &exp_mode);
+		mvcam_read(client, Gain_Mode, &gain_mode);
+		dev_info(&client->dev,
+			 "[ae] start streaming: Exposure_Mode %u (want 0=manual), Gain_Mode %u (want 0=manual), line_time %u us\n",
+			 exp_mode, gain_mode, mvcam->line_time_us);
+	}
+
     ret = mvcam_write(client, Image_Acquisition,1);
 	if (ret)
 		return ret;
@@ -1193,16 +1702,22 @@ static int mvcam_enum_frame_interval(struct v4l2_subdev *sd,
 				       struct v4l2_subdev_pad_config *cfg,
 				       struct v4l2_subdev_frame_interval_enum *fie)
 {
-    VEYE_TRACE
-    /* max framerate */
 	struct v4l2_fract fract_fps;
 	struct mvcam *mvcam = to_mvcam(sd);
+	u32 fps;
+	VEYE_TRACE
+
+	/* only one interval is reported: the fastest (1/max_fps) */
+	if (fie->index != 0)
+		return -EINVAL;
+
 	mutex_lock(&mvcam->mutex);
-    fie->width = mvcam->roi.width;
+	fps = mvcam->max_fps ? mvcam->max_fps : MV_CAM_DEF_FPS;
+	fie->width = mvcam->roi.width;
 	fie->height = mvcam->roi.height;
-    fract_fps.numerator = 100;
-    fract_fps.denominator = mvcam->max_fps*100;
-    fie->interval = fract_fps;
+	fract_fps.numerator = 1;      /* 1 / fps seconds */
+	fract_fps.denominator = fps;
+	fie->interval = fract_fps;
 	mutex_unlock(&mvcam->mutex);
 	return 0;
 }
@@ -1345,10 +1860,21 @@ VEYE_TRACE
 			continue;
 		}
 		mvcam->ctrls[i] = ctrl;
-        if(mvcam->ctrls[i]->id == V4L2_CID_VEYE_MV_FRAME_RATE){
-            mvcam->frmrate = mvcam->ctrls[i];
+        if(ctrl->id == V4L2_CID_VEYE_MV_FRAME_RATE){
+            mvcam->frmrate = ctrl;
         }
-        dev_dbg(&client->dev, "init control %s success\n",mvcam_v4l2_ctrls[i].name);
+        if(ctrl->id == V4L2_CID_EXPOSURE){
+            mvcam->exposure = ctrl;
+        }
+        /*
+         * v4l2_ctrl_fill() starts with "*flags = 0" and only re-adds what its
+         * own switch knows about, so for every entry with .name == NULL the
+         * flags declared in mvcam_v4l2_ctrls[] are thrown away (HBLANK loses
+         * READ_ONLY, EXPOSURE/ANALOGUE_GAIN lose VOLATILE, so their
+         * g_volatile_ctrl would never run). Put them back.
+         */
+        ctrl->flags |= mvcam_v4l2_ctrls[i].flags;
+        dev_dbg(&client->dev, "init control %s success\n", ctrl->name);
 	}
     
 	if (ctrl_hdlr->error) {
