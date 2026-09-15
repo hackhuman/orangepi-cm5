@@ -44,8 +44,12 @@
  * MVCAM_ENABLE_FPS_LOCK is honoured in mvcam_s_ctrl()'s VBLANK case and in
  * mvcam_start_streaming(). MVCAM_LOCKED_FPS is the frame rate used while locked.
  */
-#define MVCAM_ENABLE_FPS_LOCK	1
+#define MVCAM_ENABLE_FPS_LOCK	0
 #define MVCAM_LOCKED_FPS	30U
+
+#define MVCAM_AIQ_HBLANK       202U
+#define MVCAM_AIQ_VBLANK_MIN   1U
+#define MVCAM_AIQ_VBLANK_MAX   0xFFFFU
 
 /*
 
@@ -153,12 +157,18 @@ struct mvcam {
     u32 min_height;
     struct v4l2_rect roi;//the same as roi
     //max fps @ current roi format
-    u32 max_fps;
-    u32 cur_fps;
-    u32 line_time_us;   /* sensor row time (us), for line<->us exposure conversion */
-    u32 exp_max_lines;  /* absolute exposure cap from AE_MAX_Time, in lines */
-    u32 h_flip;
-    u32 v_flip;
+	u32 max_fps;
+	u32 cur_fps;
+
+	/* RKAIQ virtual sensor timing */
+	u32 aiq_hts;
+	u64 aiq_pixel_rate;
+	u64 line_time_ns;
+
+	u32 exp_max_lines;
+
+	u32 h_flip;
+	u32 v_flip;
     u32 lane_num;
 	u32 lanecap;
     u32 mipi_datarate;
@@ -342,27 +352,100 @@ static int mvcam_getroi(struct mvcam *mvcam)
     return 0;
 }
 
-static void mvcam_update_line_time(struct mvcam *mvcam)
+static void mvcam_update_aiq_timing(struct mvcam *mvcam)
 {
+	u32 width;
 	u32 height;
+	u32 vts_min;
 
-	/* Optional hardcoded row time; else derive it from max-fps x height. */
-	mvcam->line_time_us = MV_CAM_LINE_TIME_US_OVERRIDE;
-	if (mvcam->line_time_us)
+	width = mvcam->roi.width ?
+		mvcam->roi.width : mvcam->max_width;
+
+	height = mvcam->roi.height ?
+		mvcam->roi.height : mvcam->max_height;
+
+	if (!width || !height || !mvcam->max_fps) {
+		mvcam->aiq_hts = 0;
+		mvcam->aiq_pixel_rate = 0;
+		mvcam->line_time_ns = 0;
 		return;
-
-	height = mvcam->roi.height ? mvcam->roi.height : mvcam->max_height;
-	if (height && mvcam->max_fps) {
-		u64 rows_per_s = (u64)mvcam->max_fps * height;
-
-		if (rows_per_s <= 1000000ULL)
-			mvcam->line_time_us = 1000000ULL / rows_per_s;
 	}
-	if (!mvcam->line_time_us)
-		mvcam->line_time_us = 1000; /* ~1 ms fallback */
-	/* never hand a 0 to the exposure/vblank dividers */
-	if (mvcam->line_time_us < 1)
-		mvcam->line_time_us = 1;
+
+	/*
+	 * Use VBLANK=1 as the maximum-FPS operating point.
+	 *
+	 * This gives:
+	 *
+	 *     HTS = width + HBLANK
+	 *     VTSmin = height + 1
+	 *
+	 * and makes:
+	 *
+	 *     pixel_rate / (HTS * VTSmin) == max_fps
+	 */
+	mvcam->aiq_hts = width + MVCAM_AIQ_HBLANK;
+	vts_min = height + MVCAM_AIQ_VBLANK_MIN;
+
+	mvcam->aiq_pixel_rate =
+		(u64)mvcam->aiq_hts *
+		vts_min *
+		mvcam->max_fps;
+
+	mvcam->line_time_ns =
+		DIV_ROUND_CLOSEST_ULL(
+			(u64)mvcam->aiq_hts * 1000000000ULL,
+			mvcam->aiq_pixel_rate);
+
+	dev_info(&mvcam->client->dev,
+		 "[ae] timing: max_fps=%u hts=%u vts_min=%u "
+		 "pixel_rate=%llu line_time=%llu ns\n",
+		 mvcam->max_fps,
+		 mvcam->aiq_hts,
+		 vts_min,
+		 mvcam->aiq_pixel_rate,
+		 mvcam->line_time_ns);
+}
+
+static u32 mvcam_exp_us_to_lines(struct mvcam *mvcam, u32 exp_us)
+{
+	u64 lines;
+
+	if (!mvcam->aiq_hts || !mvcam->aiq_pixel_rate)
+		return 1;
+
+	lines = DIV_ROUND_CLOSEST_ULL(
+		(u64)exp_us * mvcam->aiq_pixel_rate,
+		(u64)mvcam->aiq_hts * 1000000ULL);
+
+	if (!lines)
+		lines = 1;
+
+	if (lines > U32_MAX)
+		lines = U32_MAX;
+
+	return (u32)lines;
+}
+
+static u32 mvcam_exp_lines_to_us(struct mvcam *mvcam, u32 lines)
+{
+	u64 exp_us;
+
+	if (!mvcam->aiq_hts || !mvcam->aiq_pixel_rate)
+		return 1;
+
+	exp_us = DIV_ROUND_CLOSEST_ULL(
+		(u64)lines *
+		mvcam->aiq_hts *
+		1000000ULL,
+		mvcam->aiq_pixel_rate);
+
+	if (!exp_us)
+		exp_us = 1;
+
+	if (exp_us > U32_MAX)
+		exp_us = U32_MAX;
+
+	return (u32)exp_us;
 }
 
 static int mvcam_setroi(struct mvcam *mvcam)
@@ -382,8 +465,14 @@ static int mvcam_setroi(struct mvcam *mvcam)
     msleep(8);
     //get sensor max framerate
     mvcam_read(client, MaxFrame_Rate,&fps_reg);
-    mvcam->max_fps = mvcam_fps_from_reg(fps_reg);
-    mvcam_update_line_time(mvcam);
+
+	mvcam->max_fps = mvcam_fps_from_reg(fps_reg);
+
+	if (!mvcam->max_fps)
+		mvcam->max_fps = MV_CAM_DEF_FPS;
+
+	mvcam_update_aiq_timing(mvcam);
+
     mvcam_read(client, Framerate,&fps_reg);
     mvcam->cur_fps = mvcam_fps_from_reg(fps_reg);
     if (!mvcam->cur_fps)
@@ -401,66 +490,84 @@ static int mvcam_setroi(struct mvcam *mvcam)
 static int mvcam_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 {
 	int ret;
-    struct mvcam *mvcam = 
-		container_of(ctrl->handler, struct mvcam, ctrl_handler);
-    struct i2c_client *client = mvcam->client;
-    
+	u32 value = 0;
+	struct mvcam *mvcam =
+		container_of(ctrl->handler,
+			     struct mvcam,
+			     ctrl_handler);
+	struct i2c_client *client = mvcam->client;
+
 	switch (ctrl->id) {
 	case V4L2_CID_VEYE_MV_TRIGGER_MODE:
-        ret = mvcam_read(client, Trigger_Mode,&ctrl->val);
+		ret = mvcam_read(client,
+				 Trigger_Mode,
+				 &value);
+		if (!ret)
+			ctrl->val = value;
 		break;
+
 	case V4L2_CID_VEYE_MV_TRIGGER_SRC:
-        ret = mvcam_read(client, Trigger_Source,&ctrl->val);
+		ret = mvcam_read(client,
+				 Trigger_Source,
+				 &value);
+		if (!ret)
+			ctrl->val = value;
 		break;
+
 	case V4L2_CID_VEYE_MV_FRAME_RATE:
-        ret = mvcam_read(client, Framerate,&ctrl->val);
-        ctrl->val = ctrl->val/100;
-        mvcam->cur_fps = ctrl->val;
+		ret = mvcam_read(client,
+				 Framerate,
+				 &value);
+		if (!ret) {
+			ctrl->val = value / 100;
+			mvcam->cur_fps = ctrl->val;
+		}
 		break;
-	case V4L2_CID_EXPOSURE:
-		/*
-		 * Exp_Time (0xC18) is microseconds, rkaiq works in lines.
-		 * mvcam_read() leaves *value untouched when the transfer
-		 * fails, so keep the cached value and report success: a
-		 * failed readback must not turn into an error that breaks
-		 * rkaiq's whole VIDIOC_G_EXT_CTRLS batch.
-		 */
-		if (!mvcam_read(client, Exp_Time, &ctrl->val))
-			ctrl->val = ctrl->val /
-				(mvcam->line_time_us ? mvcam->line_time_us : 1);
-		/*
-		 * Seeing these lines at all means somebody (rkaiq's AE) is
-		 * polling the control, i.e. the 3A loop is closed on this
-		 * sensor. Silence here while "[ae] exposure set" is printing
-		 * means rkaiq writes but never reads back.
-		 */
+
+	case V4L2_CID_EXPOSURE: {
+		u32 lines;
+
+		ret = mvcam_read(client,
+				 Exp_Time,
+				 &value);
+		if (ret)
+			break;
+
+		lines = mvcam_exp_us_to_lines(
+				mvcam,
+				value);
+
+		if (lines < ctrl->minimum)
+			lines = ctrl->minimum;
+
+		if (lines > ctrl->maximum)
+			lines = ctrl->maximum;
+
+		ctrl->val = lines;
+
 		dev_info_ratelimited(&client->dev,
-			"[ae] exposure readback -> %d lines (line_time %u us)\n",
-			ctrl->val, mvcam->line_time_us);
-		ret = 0;
+			"[ae] exposure readback %u us -> %u lines\n",
+			value,
+			lines);
+
 		break;
+	}
+
 	case V4L2_CID_ANALOGUE_GAIN:
-		/* same as above: report success, keep the cached value on failure */
-		mvcam_read(client, Cur_Gain, &ctrl->val);
-		dev_info_ratelimited(&client->dev,
-			"[ae] gain readback -> %d\n", ctrl->val);
-		ret = 0;
+		ret = mvcam_read(client,
+				 Cur_Gain,
+				 &value);
+		if (!ret)
+			ctrl->val = value;
 		break;
+
 	default:
-		dev_info(&client->dev,
-			 "mvcam_g_volatile_ctrl ctrl(id:0x%x,val:0x%x) is not handled\n",
-			 ctrl->id, ctrl->val);
 		ret = -EINVAL;
 		break;
 	}
-    
-    v4l2_dbg(1, debug, mvcam->client, "%s: cid = (0x%X), value = (%d).\n",
-                     __func__, ctrl->id, ctrl->val);
 
 	return ret;
 }
-
-#define MVCAM_AIQ_LINE_TIME_NS 28736ULL
 
 static int mvcam_s_ctrl(struct v4l2_ctrl *ctrl)
 {
@@ -500,26 +607,47 @@ static int mvcam_s_ctrl(struct v4l2_ctrl *ctrl)
         ret = 0;
 		break;
 	case V4L2_CID_EXPOSURE: {
-		u64 t;
+		u32 exp_us;
+		u32 me_time = 0;
+		u32 exp_time = 0;
+		u32 exp_mode = 0;
 
-		t = DIV_ROUND_CLOSEST_ULL(
-				(u64)ctrl->val *
-				MVCAM_AIQ_LINE_TIME_NS,
-				1000ULL);
+		exp_us = mvcam_exp_lines_to_us(
+				mvcam,
+				ctrl->val);
 
 		ret = mvcam_write(client,
-						Exposure_Mode,
-						MV_EXPOSURE_MODE_MANUAL);
+				Exposure_Mode,
+				MV_EXPOSURE_MODE_MANUAL);
 		if (ret)
 			break;
 
 		ret = mvcam_write(client,
-						ME_Time,
-						(u32)t);
+				ME_Time,
+				exp_us);
+		if (ret)
+			break;
+
+		mvcam_read(client,
+			ME_Time,
+			&me_time);
+
+		mvcam_read(client,
+			Exp_Time,
+			&exp_time);
+
+		mvcam_read(client,
+			Exposure_Mode,
+			&exp_mode);
 
 		dev_info_ratelimited(&client->dev,
-			"[ae] exposure %d lines -> %llu us\n",
-			ctrl->val, t);
+			"[ae] exposure %d lines -> %u us | "
+			"ME_Time=%u Exp_Time=%u mode=%u\n",
+			ctrl->val,
+			exp_us,
+			me_time,
+			exp_time,
+			exp_mode);
 
 		break;
 	}
@@ -538,78 +666,97 @@ static int mvcam_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	}
 	case V4L2_CID_VBLANK: {
-		u32 height = mvcam->roi.height ? mvcam->roi.height : mvcam->max_height;
+		u32 height;
 		u32 vts;
+		u64 fps_x100;
 		struct v4l2_ctrl *exp;
 
-#if MVCAM_ENABLE_FPS_LOCK
-		/*
-		 * Legacy rcaiq flat-out workaround: pin Framerate at
-		 * MVCAM_LOCKED_FPS regardless of the vblank the AE writes, and use
-		 * the locked vts below so the exposure ceiling stays at AE_MAX_Time.
-		 * The control still exists and accepts writes, so rkaiq keeps
-		 * driving exposure/gain. See the switch definition at top of file.
-		 */
-		vts = mvcam->line_time_us ?
-			1000000UL / (mvcam->line_time_us * MVCAM_LOCKED_FPS) : 0;
-		if (vts <= height)
-			vts = height + 1;
-		mvcam->cur_fps = MVCAM_LOCKED_FPS;
-		ret = mvcam_write(client, Framerate, MVCAM_LOCKED_FPS * 100);
-		dev_info_ratelimited(&client->dev,
-			"[ae] vblank set %d (locked %ufps) -> vts %u (height %u), fps %u\n",
-			ctrl->val, MVCAM_LOCKED_FPS, vts, height, MVCAM_LOCKED_FPS);
-#else
-		/*
-		 * Normal path: honour the AE's vblank. line_time * vts gives the
-		 * frame period, so fps = 1e6/(line_time_us * vts); push that into
-		 * Framerate so the FPGA inserts the right amount of blanking.
-		 */
-		{
-			u32 fps;
+		height = mvcam->roi.height ?
+			mvcam->roi.height :
+			mvcam->max_height;
 
-			vts = height + (u32)ctrl->val;
-			fps = (mvcam->line_time_us && vts) ?
-				1000000UL / (mvcam->line_time_us * vts) : 0;
-			if (!fps)
-				fps = 1;
-			mvcam->cur_fps = fps;
-			ret = mvcam_write(client, Framerate, fps * 100);
-			dev_info_ratelimited(&client->dev,
-				"[ae] vblank set %d -> vts %u (height %u), fps %u\n",
-				ctrl->val, vts, height, fps);
+		vts = height + ctrl->val;
+
+		if (!vts ||
+			!mvcam->aiq_hts ||
+			!mvcam->aiq_pixel_rate) {
+			ret = -EINVAL;
+			break;
 		}
-#endif
 
 		/*
-		 * Exposure can never exceed one frame, so grow/shrink its range
-		 * with vts, but never past the camera's own AE_MAX_Time limit.
-		 * Same pattern as sc132gs/ov9281: without this rkaiq's AE keeps
-		 * asking for exposures that cannot fit in the frame.
-		 */
+		* FPGA Framerate register unit = 0.01 fps.
+		*
+		* fps_x100 =
+		* pixel_rate * 100 /
+		* (HTS * VTS)
+		*/
+		fps_x100 = DIV_ROUND_CLOSEST_ULL(
+			mvcam->aiq_pixel_rate * 100ULL,
+			(u64)mvcam->aiq_hts * vts);
+
+		/* never exceed the camera-reported maximum */
+		if (fps_x100 >
+			(u64)mvcam->max_fps * 100ULL)
+			fps_x100 =
+				(u64)mvcam->max_fps * 100ULL;
+
+		if (!fps_x100)
+			fps_x100 = 1;
+
+		ret = mvcam_write(client,
+				Framerate,
+				(u32)fps_x100);
+		if (ret)
+			break;
+
+		mvcam->cur_fps =
+			DIV_ROUND_CLOSEST_ULL(
+				fps_x100,
+				100ULL);
+
+		dev_info_ratelimited(&client->dev,
+			"[ae] vblank=%d vts=%u -> fps=%llu.%02llu "
+			"(max=%u)\n",
+			ctrl->val,
+			vts,
+			fps_x100 / 100,
+			fps_x100 % 100,
+			mvcam->max_fps);
+
 		/*
-		 * Never call v4l2_ctrl_find() here: s_ctrl is invoked with
-		 * ctrl_handler.lock held and v4l2_ctrl_find() takes that very
-		 * lock, which deadlocks the probe (v4l2_ctrl_handler_setup())
-		 * before the board ever finishes booting. The pointer is
-		 * cached in mvcam->exposure at control-creation time.
-		 */
+		* Exposure must fit inside the current frame.
+		* Leave one line margin.
+		*/
 		exp = mvcam->exposure;
-		if (exp) {
-			s64 max = mvcam->exp_max_lines;
-			s64 def = exp->default_value;
 
-			if (vts && max > (s64)vts)
-				max = vts;
-			/* def outside [min, max] makes check_range() reject us */
+		if (exp) {
+			s64 max;
+			s64 def;
+
+			max = mvcam->exp_max_lines;
+
+			if (vts > 1 &&
+				max > (s64)(vts - 1))
+				max = vts - 1;
+
+			def = exp->default_value;
+
 			if (def > max)
 				def = max;
+
 			if (def < exp->minimum)
 				def = exp->minimum;
-			if (max > exp->minimum)
-				__v4l2_ctrl_modify_range(exp, exp->minimum, max,
-							 exp->step, def);
+
+			if (max >= exp->minimum)
+				__v4l2_ctrl_modify_range(
+					exp,
+					exp->minimum,
+					max,
+					exp->step,
+					def);
 		}
+
 		break;
 	}
 	case V4L2_CID_HFLIP:
@@ -726,11 +873,11 @@ static struct v4l2_ctrl_config mvcam_v4l2_ctrls[] = {
 	{
 		.ops = &mvcam_ctrl_ops,
 		.id = V4L2_CID_VBLANK,
-		.name = NULL,//kernel will fill it
+		.name = NULL,
 		.type = V4L2_CTRL_TYPE_INTEGER,
-		.def = 0,//overwritten at probe
-		.min = 0,
-		.max = 0xFFFF,//overwritten at probe
+		.def = MVCAM_AIQ_VBLANK_MIN,
+		.min = MVCAM_AIQ_VBLANK_MIN,
+		.max = MVCAM_AIQ_VBLANK_MAX,
 		.step = 1,
 		.flags = 0,
 	},
@@ -868,6 +1015,29 @@ static void mvcam_v4l2_ctrl_init(struct mvcam *mvcam)
     int i = 0;
     u32 value = 0;
     struct i2c_client *client = mvcam->client;
+
+	u32 fps_reg = 0;
+
+	/*
+	 * Read timing information first.
+	 * PIXEL_RATE/HBLANK/VBLANK/EXPOSURE all depend on this.
+	 */
+	mvcam_read(client, MaxFrame_Rate, &fps_reg);
+
+	mvcam->max_fps = mvcam_fps_from_reg(fps_reg);
+
+	if (!mvcam->max_fps)
+		mvcam->max_fps = MV_CAM_DEF_FPS;
+
+	mvcam_read(client, Framerate, &fps_reg);
+
+	mvcam->cur_fps = mvcam_fps_from_reg(fps_reg);
+
+	if (!mvcam->cur_fps)
+		mvcam->cur_fps = mvcam->max_fps;
+
+	mvcam_update_aiq_timing(mvcam);
+
     for (i = 0; i < ARRAY_SIZE(mvcam_v4l2_ctrls); ++i) {
 		switch(mvcam_v4l2_ctrls[i].id)
         {
@@ -909,47 +1079,59 @@ static void mvcam_v4l2_ctrl_init(struct mvcam *mvcam)
 				mvcam_v4l2_ctrls[i].def = mvcam->roi.top;
             break;
 			case V4L2_CID_EXPOSURE: {
-				u32 fps_reg = 0;
+				u32 exp_us = 0;
 				u32 exp_us_max = 0;
-				mvcam_read(client, MaxFrame_Rate, &fps_reg);
-				mvcam->max_fps = mvcam_fps_from_reg(fps_reg);
-				if (!mvcam->max_fps)
-					mvcam->max_fps = MV_CAM_DEF_FPS;
-				mvcam_update_line_time(mvcam);
-				/* current exposure -> default (us to lines) */
-				mvcam_read(client, Exp_Time, &value);
-				if (value && value != 0xFFFFFFFF)
-					mvcam_v4l2_ctrls[i].def = value / mvcam->line_time_us;
-				/* max exposure -> upper bound (us to lines) */
+
+				/* Current FPGA exposure: us -> RKAIQ lines */
+				mvcam_read(client, Exp_Time, &exp_us);
+
+				if (exp_us && exp_us != 0xFFFFFFFF)
+					mvcam_v4l2_ctrls[i].def =
+						mvcam_exp_us_to_lines(mvcam, exp_us);
+
+				/*
+				* Keep the existing AE_MAX_Time limit for the first
+				* variable-fps test. This can be removed later when
+				* we enable exposure beyond the FPGA internal-AE limit.
+				*/
 				mvcam_read(client, AE_MAX_Time, &exp_us_max);
+
 				if (exp_us_max && exp_us_max != 0xFFFFFFFF)
 					mvcam_v4l2_ctrls[i].max =
-						exp_us_max / mvcam->line_time_us;
+						mvcam_exp_us_to_lines(mvcam, exp_us_max);
 				else
 					mvcam_v4l2_ctrls[i].max =
-						1000000UL / mvcam->line_time_us;
-				/* keep def inside [min,max] or the ctrl fails to register */
-				if (mvcam_v4l2_ctrls[i].max < mvcam_v4l2_ctrls[i].min + 1)
+						mvcam_exp_us_to_lines(mvcam, 1000000U);
+
+				if (mvcam_v4l2_ctrls[i].max <
+					mvcam_v4l2_ctrls[i].min + 1)
 					mvcam_v4l2_ctrls[i].max =
 						mvcam_v4l2_ctrls[i].min + 1;
-				if (mvcam_v4l2_ctrls[i].def < mvcam_v4l2_ctrls[i].min)
-					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].min;
-				if (mvcam_v4l2_ctrls[i].def > mvcam_v4l2_ctrls[i].max)
-					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].max;
-				/* hard cap, re-applied whenever vblank changes */
-				mvcam->exp_max_lines = mvcam_v4l2_ctrls[i].max;
-				/*
-				 * One-shot at probe: the numbers every later [ae] line
-				 * has to be read against. If line_time is absurd here,
-				 * every lines -> microseconds conversion is off by the
-				 * same factor, so check this line first.
-				 */
+
+				if (mvcam_v4l2_ctrls[i].def <
+					mvcam_v4l2_ctrls[i].min)
+					mvcam_v4l2_ctrls[i].def =
+						mvcam_v4l2_ctrls[i].min;
+
+				if (mvcam_v4l2_ctrls[i].def >
+					mvcam_v4l2_ctrls[i].max)
+					mvcam_v4l2_ctrls[i].def =
+						mvcam_v4l2_ctrls[i].max;
+
+				mvcam->exp_max_lines =
+					mvcam_v4l2_ctrls[i].max;
+
 				dev_info(&client->dev,
-					 "[ae] exposure range %lld..%lld lines (def %lld), line_time %u us, Exp_Time %u us, AE_MAX_Time %u us\n",
-					 mvcam_v4l2_ctrls[i].min,
-					 mvcam_v4l2_ctrls[i].max,
-					 mvcam_v4l2_ctrls[i].def,
-					 mvcam->line_time_us, value, exp_us_max);
+					"[ae] exposure range %lld..%lld lines "
+					"(def %lld), line_time=%llu ns, "
+					"Exp_Time=%u us, AE_MAX_Time=%u us\n",
+					mvcam_v4l2_ctrls[i].min,
+					mvcam_v4l2_ctrls[i].max,
+					mvcam_v4l2_ctrls[i].def,
+					mvcam->line_time_ns,
+					exp_us,
+					exp_us_max);
+
 				break;
 			}
 			case V4L2_CID_ANALOGUE_GAIN:
@@ -973,52 +1155,92 @@ static void mvcam_v4l2_ctrl_init(struct mvcam *mvcam)
 					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].max;
 				break;
 			case V4L2_CID_VBLANK: {
-				u32 height = mvcam->roi.height ? mvcam->roi.height : mvcam->max_height;
-				mvcam_read(client, Framerate, &value);
-				mvcam->cur_fps = mvcam_fps_from_reg(value);
-				if (!mvcam->cur_fps)
-					mvcam->cur_fps = mvcam->max_fps;
-				if (mvcam->line_time_us && mvcam->cur_fps && height) {
-					s64 vts = 1000000ULL / ((s64)mvcam->line_time_us * mvcam->cur_fps);
-					if (vts > height)
-						mvcam_v4l2_ctrls[i].def = vts - height;
-				}
-				if (mvcam->line_time_us) {
-					u32 max_vts = 1000000UL / mvcam->line_time_us;
-					if (max_vts > height)
-						mvcam_v4l2_ctrls[i].max = max_vts - height;
-					else
-						mvcam_v4l2_ctrls[i].max = height;
-				}
+				u32 height;
+				u32 fps_x100;
+				u64 vts;
+				u64 vblank;
+
+				height = mvcam->roi.height ?
+					mvcam->roi.height :
+					mvcam->max_height;
+
+				mvcam_read(client, Framerate, &fps_x100);
+
+				if (!fps_x100 ||
+					fps_x100 == 0xFFFFFFFF)
+					fps_x100 = mvcam->max_fps * 100U;
+
 				/*
-				 * rkcif_get_linetime() bails out (and breaks the
-				 * ISP early-line timing) when the sensor reports a
-				 * zero vblank default, so never hand it 0.
-				 */
-				if (mvcam_v4l2_ctrls[i].max < 1)
-					mvcam_v4l2_ctrls[i].max = 1;
-				if (mvcam_v4l2_ctrls[i].def < 1)
-					mvcam_v4l2_ctrls[i].def = 1;
-				if (mvcam_v4l2_ctrls[i].def > mvcam_v4l2_ctrls[i].max)
-					mvcam_v4l2_ctrls[i].def = mvcam_v4l2_ctrls[i].max;
+				* fps_x100 is FPGA Framerate register value.
+				*
+				* fps = pixel_rate / (hts * vts)
+				*
+				* therefore:
+				*
+				* vts =
+				* pixel_rate * 100 /
+				* (hts * fps_x100)
+				*/
+				vts = DIV_ROUND_CLOSEST_ULL(
+					mvcam->aiq_pixel_rate * 100ULL,
+					(u64)mvcam->aiq_hts * fps_x100);
+
+				if (vts <= height)
+					vts = height + MVCAM_AIQ_VBLANK_MIN;
+
+				vblank = vts - height;
+
+				if (vblank < MVCAM_AIQ_VBLANK_MIN)
+					vblank = MVCAM_AIQ_VBLANK_MIN;
+
+				if (vblank > MVCAM_AIQ_VBLANK_MAX)
+					vblank = MVCAM_AIQ_VBLANK_MAX;
+
+				mvcam_v4l2_ctrls[i].min =
+					MVCAM_AIQ_VBLANK_MIN;
+
+				mvcam_v4l2_ctrls[i].max =
+					MVCAM_AIQ_VBLANK_MAX;
+
+				mvcam_v4l2_ctrls[i].def =
+					vblank;
+
 				dev_info(&client->dev,
-					 "[ae] vblank range %lld..%lld (def %lld), height %u, fps %u, max_fps %u\n",
-					 mvcam_v4l2_ctrls[i].min,
-					 mvcam_v4l2_ctrls[i].max,
-					 mvcam_v4l2_ctrls[i].def, height,
-					 mvcam->cur_fps, mvcam->max_fps);
+					"[ae] vblank range %lld..%lld def=%lld, "
+					"current fps=%u.%02u max_fps=%u\n",
+					mvcam_v4l2_ctrls[i].min,
+					mvcam_v4l2_ctrls[i].max,
+					mvcam_v4l2_ctrls[i].def,
+					fps_x100 / 100,
+					fps_x100 % 100,
+					mvcam->max_fps);
+
 				break;
 			}
 			case V4L2_CID_HBLANK: {
-				u32 width = mvcam->roi.width ? mvcam->roi.width : mvcam->max_width;
-				u32 hts = mvcam->line_time_us * (MV_CAM_PIXEL_RATE / 1000000UL);
-				if (hts > width) {
-					mvcam_v4l2_ctrls[i].def = hts - width;
-					mvcam_v4l2_ctrls[i].min = hts - width;
-					mvcam_v4l2_ctrls[i].max = hts - width;
-				}
+				mvcam_v4l2_ctrls[i].min =
+					MVCAM_AIQ_HBLANK;
+
+				mvcam_v4l2_ctrls[i].max =
+					MVCAM_AIQ_HBLANK;
+
+				mvcam_v4l2_ctrls[i].def =
+					MVCAM_AIQ_HBLANK;
 				break;
 			}
+
+			case V4L2_CID_PIXEL_RATE: {
+				mvcam_v4l2_ctrls[i].min =
+					mvcam->aiq_pixel_rate;
+
+				mvcam_v4l2_ctrls[i].max =
+					mvcam->aiq_pixel_rate;
+
+				mvcam_v4l2_ctrls[i].def =
+					mvcam->aiq_pixel_rate;
+				break;
+			}
+
             default:
             break;
         }
@@ -1599,8 +1821,16 @@ static int mvcam_start_streaming(struct mvcam *mvcam)
 		mvcam_read(client, Exposure_Mode, &exp_mode);
 		mvcam_read(client, Gain_Mode, &gain_mode);
 		dev_info(&client->dev,
-			 "[ae] start streaming: Exposure_Mode %u (want 0=manual), Gain_Mode %u (want 0=manual), line_time %u us\n",
-			 exp_mode, gain_mode, mvcam->line_time_us);
+			"[ae] start streaming: Exposure_Mode %u (want 0=manual), "
+			"Gain_Mode %u (want 0=manual), "
+			"line_time=%llu ns, max_fps=%u, "
+			"pixel_rate=%llu, hts=%u\n",
+			exp_mode,
+			gain_mode,
+			mvcam->line_time_ns,
+			mvcam->max_fps,
+			mvcam->aiq_pixel_rate,
+			mvcam->aiq_hts);
 	}
 
     ret = mvcam_write(client, Image_Acquisition,1);
