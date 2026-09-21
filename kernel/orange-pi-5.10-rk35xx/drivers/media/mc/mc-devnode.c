@@ -217,12 +217,34 @@ int __must_check media_devnode_register(struct media_device *mdev,
 
 	/* Part 1: Find a free minor number */
 	mutex_lock(&media_devnode_lock);
-	minor = find_next_zero_bit(media_devnode_nums, MEDIA_NUM_DEVICES, 0);
-	if (minor == MEDIA_NUM_DEVICES) {
-		mutex_unlock(&media_devnode_lock);
-		pr_err("could not get a free minor\n");
-		kfree(devnode);
-		return -ENFILE;
+
+	/*
+	* Force RK3588 RKCIF MIPI/LVDS2 to /dev/media1.
+	*
+	* This keeps V4L2 video node registration order unchanged, so
+	* rkcif can still be video0~video10 and rkisp mainpath stays video11.
+	*/
+	if (mdev &&
+		!strcmp(mdev->model, "rkcif-mipi-lvds2")) {
+		minor = 1;
+
+		if (test_bit(minor, media_devnode_nums)) {
+			mutex_unlock(&media_devnode_lock);
+			pr_err("media%d already occupied by another media device\n",
+				minor);
+			kfree(devnode);
+			return -EBUSY;
+		}
+	} else {
+		minor = find_first_zero_bit(media_devnode_nums,
+									MEDIA_NUM_DEVICES);
+
+		if (minor == MEDIA_NUM_DEVICES) {
+			mutex_unlock(&media_devnode_lock);
+			pr_err("could not get a free minor\n");
+			kfree(devnode);
+			return -ENFILE;
+		}
 	}
 
 	set_bit(minor, media_devnode_nums);
