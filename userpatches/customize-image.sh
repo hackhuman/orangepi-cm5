@@ -40,7 +40,98 @@ Main() {
 			;;
 	esac
 	SetStaticEthernetIP
+	SetEnvironmentVars
+	InstallQt514
+	RemoveSystemQt515
+	InstallIicTools
+	TweakSshConfig
 } # Main
+
+SetEnvironmentVars() {
+	# 在镜像内写入系统级环境变量
+	#
+	# 位置 1: /etc/environment
+	#   - 所有经 PAM 登录的 shell 都会读到(本地终端、ssh、GUI)
+	#   - 格式: VAR="value"(一行一个),引号内不要展开 $HOME 之类
+	#   - 注意: systemd 服务默认不读它,若要给守护进程用请看 profile.d 或 systemd
+	cat > /etc/environment <<- EOF
+	LANG=en_US.UTF-8
+	MY_APP_HOME=/opt/myapp
+	EOF
+
+	# 位置 2: /etc/profile.d/*.sh(可加 export、可做判断)
+	#   登录 shell 会 source 这里的所有 .sh,支持 bash 语法
+	cat > /etc/profile.d/myenv.sh <<- 'EOF'
+	# 自定义环境变量(登录 shell 生效)
+	export MY_APP_DEBUG=1
+	export PATH="/opt/myapp/bin:$PATH"
+	export LD_LIBRARY_PATH=/usr/lib/qt514:/usr/lib:$LD_LIBRARY_PATH
+	EOF
+	chmod 644 /etc/profile.d/myenv.sh
+} # SetEnvironmentVars
+
+InstallQt514() {
+	# 原生(BSP 包)注入 —— 见 external/packages/bsp/common/:
+	#   usr/lib/qt514/...        -> /usr/lib/qt514/...   (库文件,你自备)
+	#   etc/ld.so.conf.d/qt514.conf                       (指向上面目录)
+	# BSP deb 先于本脚本安装到 rootfs(distributions.sh),这里只让
+	# ld.so 重载配置,使所有进程(含 systemd 服务)都能找到 Qt 库。
+	ldconfig || true
+} # InstallQt514
+
+RemoveSystemQt515() {
+	# 构建期一次性移除系统 apt 的 Qt 5.15 库,避免程序混入 5.15 而报
+	# "Cannot mix incompatible Qt library"。本机程序必须用自带 5.14,
+	# 系统 5.15 会导致 5.14.1 主库 + 5.15.3 插件同时进进程 -> 拒绝启动。
+	#
+	# NOTE: 必须删整条链的 3 个节点,且必须删真身(.5.15.3),否则 ldconfig
+	#       会依据残留真身把两条软链接(.so.5 / .so.5.15)重新建回来:
+	#       .so.5 -> .so.5.15 -> .so.5.15.3(真身)
+	# 只动 Core/Network 两条链;不触碰 libqt5gui5 等其它包的文件。
+	# 代价:镜像内依赖系统 5.15 的包(桌面/webengine 等)丢失该库,勿再 apt。
+	local d=/usr/lib/aarch64-linux-gnu
+	for base in libQt5Core libQt5Network; do
+		rm -f "${d}/${base}.so.5" "${d}/${base}.so.5.15"    # 软链接
+		rm -f "${d}/${base}.so.5.15.3"                       # 真身,ldconfig 无源可建
+	done
+	ldconfig || true
+} # RemoveSystemQt515
+
+InstallIicTools() {
+	# 内置相机 MCU 工具树到 /root/iic,并补齐运行时权限。
+	#
+	# 文件本体经 BSP 包内置:放在 external/packages/bsp/common/root/iic/
+	# (makeboarddeb.sh 里 rsync common/* 到 deb 根 -> 装到镜像 /)。
+	# BSP 打包会跑 dh_fixperms(chmod 'go=rX,u+rw,a-s'),不会给已有文件加 +x;
+	# 且 Samba 落盘时 +x 位也常丢,所以这里显式补齐 +x(脚本/二进制)。
+	local iic=/root/iic
+
+	if [ ! -d "$iic" ]; then
+		echo "[iic] not present at ${iic}, skip (did you stage external/packages/bsp/common/root/iic/?)"
+		return 0
+	fi
+
+	find "$iic" -type f \( \
+		-name '*.sh' \
+		-o -name 'i2c_read' -o -name 'i2c_write' \
+		-o -name 'i2c_4read' -o -name 'i2c_4write' \
+		-o -name 'lut_rw' -o -name 'veye_i2c_upgrade' \
+	\) -exec chmod +x {} +
+
+	find "$iic" -type d -exec chmod 0755 {} +
+
+	echo "[iic] tool tree present & perms set: ${iic}"
+} # InstallIicTools
+
+TweakSshConfig() {
+	# 兼容旧版 SSH 客户端:把镜像里较新的 sshd 已从默认集合
+	# 移除的算法加回去。用 '+xxx' 追加到默认集合,不影响其余默认项。
+	# 注意:这里只能追加,不能整文件覆盖(会丢掉发行版默认配置)。
+	local sshd=/etc/ssh/sshd_config
+	[ -f "$sshd" ] || return 0
+	echo "KexAlgorithms +diffie-hellman-group1-sha1" >> "$sshd"
+	echo "HostKeyAlgorithms +ssh-rsa" >> "$sshd"
+} # TweakSshConfig
 
 SetStaticEthernetIP() {
 	# 目标系统的有线网口名：RK3588 通常为 end0 或 eth0，可用
