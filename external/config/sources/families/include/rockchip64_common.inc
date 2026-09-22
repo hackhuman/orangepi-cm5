@@ -3,6 +3,7 @@ source "${BASH_SOURCE%/*}/rk35xx_gpu_vpu.inc"
 source "${BASH_SOURCE%/*}/rk356x_gpu_vpu.inc"
 
 enable_extension "rkbin-tools"
+enable_extension "reset-machine-id"
 ARCH=arm64
 KERNEL_IMAGE_TYPE=Image
 OFFSET=30
