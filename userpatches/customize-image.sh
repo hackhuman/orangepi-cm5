@@ -44,6 +44,7 @@ Main() {
 	InstallQt514
 	RemoveSystemQt515
 	InstallIicTools
+	InstallMvcamMediaCtlWrapper
 	TweakSshConfig
 } # Main
 
@@ -64,7 +65,7 @@ SetEnvironmentVars() {
 	cat > /etc/profile.d/myenv.sh <<- 'EOF'
 	# 自定义环境变量(登录 shell 生效)
 	export MY_APP_DEBUG=1
-	export PATH="/opt/myapp/bin:$PATH"
+	export PATH="/usr/local/bin:/opt/myapp/bin:$PATH"
 	export LD_LIBRARY_PATH=/usr/lib/qt514:/usr/lib:$LD_LIBRARY_PATH
 	EOF
 	chmod 644 /etc/profile.d/myenv.sh
@@ -122,6 +123,19 @@ InstallIicTools() {
 
 	echo "[iic] tool tree present & perms set: ${iic}"
 } # InstallIicTools
+
+InstallMvcamMediaCtlWrapper() {
+    local wrapper=/usr/local/bin/media-ctl
+
+    if [ ! -f "$wrapper" ]; then
+        echo "[MVCAM] ERROR: media-ctl wrapper not found!"
+        return 1
+    fi
+
+    chmod 755 "$wrapper" || return 1
+
+    echo "[MVCAM] media-ctl wrapper installed."
+} # InstallMvcamMediaCtlWrapper
 
 TweakSshConfig() {
 	# 兼容旧版 SSH 客户端:把镜像里较新的 sshd 已从默认集合

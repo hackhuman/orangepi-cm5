@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# MVCAM media-ctl wrapper: synchronize RKISP sink format and crop
+# only after the specified sensor's format command succeeds.
+REAL=/usr/bin/media-ctl
+DEVICE=''
+SPEC=''
+SET_FMT_COUNT=0
+ARGS=("$@")
+
+for ((i=0; i<${#ARGS[@]}; i++)); do
+    case "${ARGS[i]}" in
+        -d|--device)
+            DEVICE="${ARGS[i+1]:-}"
+            ;;
+        --device=*)
+            DEVICE="${ARGS[i]#*=}"
+            ;;
+        --set-v4l2)
+            SPEC="${ARGS[i+1]:-}"
+            ((SET_FMT_COUNT+=1))
+            ;;
+        --set-v4l2=*)
+            SPEC="${ARGS[i]#*=}"
+            ((SET_FMT_COUNT+=1))
+            ;;
+    esac
+done
+
+PATTERN='^"m00_b_mvcam 6-003b":0\[fmt:Y8_1X8/([0-9]+)x([0-9]+)(@[0-9]+/[0-9]+)?\]$'
+
+# Pass through any non-matching invocation unchanged.
+if [[ "$DEVICE" != '/dev/media1' || "$SET_FMT_COUNT" -ne 1 || ! "$SPEC" =~ $PATTERN ]]; then
+    exec "$REAL" "${ARGS[@]}"
+fi
+
+WIDTH="${BASH_REMATCH[1]}"
+HEIGHT="${BASH_REMATCH[2]}"
+if ((10#$WIDTH == 0 || 10#$HEIGHT == 0)); then
+    exec "$REAL" "${ARGS[@]}"
+fi
+
+# Configuration must be performed while capture is stopped.
+"$REAL" "${ARGS[@]}" || exit $?
+"$REAL" -d /dev/media0 \
+    --set-v4l2 "\"rkisp-isp-subdev\":0[fmt:Y8_1X8/${WIDTH}x${HEIGHT}]" || exit $?
+"$REAL" -d /dev/media0 \
+    --set-v4l2 "\"rkisp-isp-subdev\":0[crop:(0,0)/${WIDTH}x${HEIGHT}]" || exit $?
+
+echo "[mvcam] ISP format/crop synced to ${WIDTH}x${HEIGHT}" >&2
