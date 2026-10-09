@@ -137,7 +137,12 @@ compile_uboot()
 	# read uboot version
 	local version hash
 	version=$(grab_version "$ubootdir")
-	hash=$(improved_git --git-dir="$ubootdir"/.git rev-parse HEAD)
+	# the source tree may be vendored in without a git repo; only query git when .git exists
+	if [[ -d "${ubootdir}/.git" ]]; then
+		hash=$(improved_git --git-dir="$ubootdir"/.git rev-parse HEAD)
+	else
+		hash="local"
+	fi
 
 	display_alert "Compiling u-boot" "v$version" "info"
 
@@ -390,8 +395,12 @@ compile_kernel()
 	local version hash
 	version=$(grab_version "$kerneldir")
 
-	# read kernel git hash
-	hash=$(improved_git --git-dir="$kerneldir"/.git rev-parse HEAD)
+	# read kernel git hash; the tree may be vendored in without a git repo, only query git when .git exists
+	if [[ -d "${kerneldir}/.git" ]]; then
+		hash=$(improved_git --git-dir="$kerneldir"/.git rev-parse HEAD)
+	else
+		hash="local"
+	fi
 
 	# Apply a series of patches if a series file exists
 	if test -f "${EXTER}"/patch/kernel/${KERNELPATCHDIR}/series.conf; then
